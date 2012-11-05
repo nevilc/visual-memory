@@ -329,14 +329,14 @@ int main(int argc, char** argv) {
 				std::min(
 					0.0f, 
 					std::max(
-						-float(sprite.getTextureRect().width - main_window.getSize().x), 
+						float(main_window.getSize().x) - sprite.getTextureRect().width, 
 						sprite.getPosition().x
 					)
 				), 
 				std::min(
 					0.0f, 
 					std::max(
-						-float(sprite.getTextureRect().height - main_window.getSize().y), 
+						float(main_window.getSize().y) - sprite.getTextureRect().height, 
 						sprite.getPosition().y
 					)
 				)
