@@ -16,29 +16,39 @@
 #include <SFML/Graphics.hpp>
 
 struct color_format {
+	// Total bytes that represent a single pixel
 	int bytes_per_pixel;
+	// Position of the corresponding pixel
+	// If negative, represents a constant absolute value of the pixel
+	// e.g. green_byte in RGBA32 is 2,
+	// alpha_byte in RGB24 is -255 (always max)
 	int red_byte;
 	int blue_byte;
 	int green_byte;
 	int alpha_byte;
 };
 
-color_format Mono8 = {1, 0, 0, 0, -255};
-color_format RGBA32 = {4, 0, 1, 2, 3};
-color_format RGB24 = {3, 0, 1, 2, -255};
-color_format ABGR32 = {4, 3, 2, 1, 0};
-color_format BGR24 = {3, 2, 1, 0, -255};
+const color_format Mono8 = {1, 0, 0, 0, -255};
+const color_format RGBA32 = {4, 0, 1, 2, 3};
+const color_format RGB24 = {3, 0, 1, 2, -255};
+const color_format ABGR32 = {4, 3, 2, 1, 0};
+const color_format BGR24 = {3, 2, 1, 0, -255};
 
 struct display_settings {
-	color_format* pixel_format;
+	// A predefined color format
+	const color_format* pixel_format;
+	// Width of the image
+	// (Height is calculated based on memory block size)
 	int width;
+	// Skip n bytes at the beginning of the memory block
 	int byte_offset;
+	// Skip n pixels at the beginning of the memory block
 	int pixel_offset;
-
+	// The current memory block address
 	char* memory_block;
+	// Do not show blocks with fewer bytes than this
+	int min_block_size;
 };
-
-int min_block_size = 1024 * 1024 * 1;
 
 DWORD find_process_by_name(std::string process_name) {
 	HANDLE system_snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -73,15 +83,18 @@ void close_process(HANDLE process_handle) {
 	CloseHandle(process_handle);
 }
 
-MEMORY_BASIC_INFORMATION find_next_memory_block(HANDLE process_handle, void* address) {
+MEMORY_BASIC_INFORMATION find_next_memory_block(HANDLE process_handle, void* address, int min_block_size) {
 	MEMORY_BASIC_INFORMATION mbi;
 	
+	// Starting at the current memory block, find the next used block
 	VirtualQueryEx(process_handle, address, &mbi, sizeof(mbi));
 	do {
 		address = (char*)mbi.BaseAddress + mbi.RegionSize;
+		// If VirtualQueryEx fails, restart at beginning of memory
 		while (!VirtualQueryEx(process_handle, address, &mbi, sizeof(mbi))) {
 			address = 0x00000000;
 		}
+		// continue until memory is not free, reserved, or too small
 	} while (mbi.State == MEM_FREE || mbi.State == MEM_RESERVE || mbi.RegionSize < min_block_size);
 
 	return mbi;
@@ -89,26 +102,37 @@ MEMORY_BASIC_INFORMATION find_next_memory_block(HANDLE process_handle, void* add
 
 void convert_memory_to_texture(HANDLE process, MEMORY_BASIC_INFORMATION mbi, display_settings ds, sf::Texture& texture) {
 	SIZE_T bytes_read;
+	// Expect to read bytes equal to the region size, minus any offsets
 	SIZE_T expected_bytes = mbi.RegionSize - (ds.byte_offset + ds.pixel_offset * ds.pixel_format->bytes_per_pixel);
+	// Allocate enough memory to store pixel data as RGBA32
+	// Currently will segfault on color formats with >4 bytes per pixel
 	unsigned char* image_data = new unsigned char[expected_bytes * 4 / ds.pixel_format->bytes_per_pixel];
 	
 	ReadProcessMemory(process, (LPVOID)(ds.memory_block + ds.byte_offset + ds.pixel_offset * ds.pixel_format->bytes_per_pixel), (LPVOID)image_data, expected_bytes, &bytes_read);
 	int width = ds.width;
+	// If we didn't get the amount we expected, something mysterious went wrong
 	if (bytes_read != expected_bytes) {
 		std::cerr << "Error reading process memory\n";
 		return;
 	}
+	// Calculate the image height based on the data and width
+	// Some pixels will likely get cut off
 	int height = bytes_read / (ds.pixel_format->bytes_per_pixel * ds.width);
 
+	// Convert to RGBA32
 	if (ds.pixel_format != &RGBA32) {
+		// Reverse iterate so conversion can be done in place
 		for (int i = width * height - 1; i >= 0; --i) {
 			unsigned char r;
 			unsigned char g;
 			unsigned char b;
 			unsigned char a;
+			
 			if (ds.pixel_format->red_byte >= 0) {
+				// x_byte gives the byte offset of the color
 				r = image_data[i*ds.pixel_format->bytes_per_pixel + ds.pixel_format->red_byte];
 			} else {
+				// x_byte is the negative of a constant value
 				r = -ds.pixel_format->red_byte;
 			}
 			if (ds.pixel_format->blue_byte >= 0) {
@@ -126,6 +150,7 @@ void convert_memory_to_texture(HANDLE process, MEMORY_BASIC_INFORMATION mbi, dis
 			} else {
 				a = -ds.pixel_format->alpha_byte;
 			}
+			
 			image_data[i*4] = r;
 			image_data[i*4+1] = g;
 			image_data[i*4+2] = b;
@@ -133,6 +158,7 @@ void convert_memory_to_texture(HANDLE process, MEMORY_BASIC_INFORMATION mbi, dis
 		}
 	}
 	
+	// Create an image and update texture on graphics card
 	sf::Image image;
 	image.create(ds.width, height, image_data);
 
@@ -142,17 +168,15 @@ void convert_memory_to_texture(HANDLE process, MEMORY_BASIC_INFORMATION mbi, dis
 }
 
 int main(int argc, char** argv) {
-	sf::RenderWindow main_window(sf::VideoMode(1200, 960), "Memory Visualizer", sf::Style::Close | sf::Style::Titlebar);
-	main_window.setFramerateLimit(30);
-
 	if (argc < 2) {
 		std::cout << "Usage: " << argv[0] << " process\n";
 		return EXIT_SUCCESS;
 	}
-
+	
 	DWORD pid;
 
 	bool is_pid = true;
+	// If argv[1] is numbers only, it is already a pid
 	for (int i = 0; argv[1][i] != '\0'; ++i) {
 		if ((argv[1][i] < '0' || argv[1][i] > '9') && argv[1][i] != ' ') {
 			is_pid = false;
@@ -174,6 +198,7 @@ int main(int argc, char** argv) {
 	ds.byte_offset = 0;
 	ds.width = 800;
 	ds.pixel_format = &RGB24;
+	ds.min_block_size = 1 * 1024 * 1024;
 
 	if (argc >= 3) {
 		if (strcmp("RGBA32", argv[2]) == 0) {
@@ -192,13 +217,18 @@ int main(int argc, char** argv) {
 	}
 
 	if (argc >= 4) {
-		min_block_size = atoi(argv[3]);
+		ds.min_block_size = atoi(argv[3]);
 	}
 
+	sf::RenderWindow main_window(sf::VideoMode(1200, 960), "Memory Visualizer", sf::Style::Close | sf::Style::Titlebar);
+	main_window.setFramerateLimit(30);
+
 	HANDLE process = open_process(pid);
-	MEMORY_BASIC_INFORMATION mbi = find_next_memory_block(process, 0x00000000);
+	// Find the first memory block
+	MEMORY_BASIC_INFORMATION mbi = find_next_memory_block(process, 0x00000000, ds.min_block_size);
 	ds.memory_block = (char*)mbi.BaseAddress;
 
+	// Create texture, sprite, view, and render the first texture
 	sf::Texture texture;
 	sf::Sprite sprite;
 	sf::View view = main_window.getDefaultView();
@@ -210,8 +240,11 @@ int main(int argc, char** argv) {
 	while (main_window.isOpen()) {
 		sf::Event event;
 
+		// Do position bounds need to be reapplied?
 		bool dirty_position = false;
+		// Does the texture need to be recreated?
 		bool dirty_texture = false;
+		// Does the pixel offset bounds (and texture) need to be reapplied?
 		bool dirty_pixel_offset = false;
 
 		while (main_window.pollEvent(event)) {
@@ -225,7 +258,8 @@ int main(int argc, char** argv) {
 					main_window.close();
 					break;
 				case sf::Keyboard::Return:
-					mbi = find_next_memory_block(process, (void*)ds.memory_block);
+					// Find the next memory block
+					mbi = find_next_memory_block(process, (void*)ds.memory_block, ds.min_block_size);
 					ds.memory_block = (char*)mbi.BaseAddress;
 					std::cout << (void*)ds.memory_block << " (" << mbi.RegionSize << " bytes)\n";
 					ds.pixel_offset = 0;
@@ -249,6 +283,7 @@ int main(int argc, char** argv) {
 					dirty_texture = true;
 					break;
 				case sf::Keyboard::F1:
+					// Debugging info
 					std::cout << '(' << texture.getSize().x << " x " << texture.getSize().y << ")\n";
 					std::cout << (void*)ds.memory_block << '\n';
 					{
@@ -262,6 +297,7 @@ int main(int argc, char** argv) {
 					}
 					break;
 				case sf::Keyboard::F12:
+					// Save texture to file
 					std::cout << "Image saved as " << "out.png" << '\n';
 					texture.copyToImage().saveToFile("out.png");
 					break;
@@ -273,6 +309,8 @@ int main(int argc, char** argv) {
 			}
 		}
 
+		// Shift increases action magnitude,
+		// alt decreases it
 		bool shifted = (sf::Keyboard::isKeyPressed(sf::Keyboard::LShift) || sf::Keyboard::isKeyPressed(sf::Keyboard::RShift));
 		bool alted = (sf::Keyboard::isKeyPressed(sf::Keyboard::LAlt) || sf::Keyboard::isKeyPressed(sf::Keyboard::RAlt));
 
@@ -320,11 +358,13 @@ int main(int argc, char** argv) {
 		}
 
 		if (dirty_pixel_offset) {
+			// pixel offset should never be greater than the width of the image
 			ds.pixel_offset %= texture.getSize().x;
 			dirty_texture = true;
 		}
 
 		if (dirty_position) {
+			// Keep sprite within window bounds
 			sprite.setPosition(
 				std::min(
 					0.0f, 
@@ -344,6 +384,7 @@ int main(int argc, char** argv) {
 		}
 
 		if (dirty_texture) {
+			// Recreate texture
 			convert_memory_to_texture(process, mbi, ds, texture);
 			sprite.setTexture(texture, true);
 		}
